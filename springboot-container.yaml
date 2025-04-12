@@ -1,0 +1,201 @@
+name: create-springboot-container
+
+trigger: none
+
+pool: 
+  vmImage: ubuntu-latest
+
+resources:
+  repositories:
+  - repository: spring-docker-demo
+    type: git
+    name: naiara-garcia/spring-docker-demo
+
+  variables:
+  - group: springboot-container
+
+  parameters:
+  - name: image
+    displayName: Image name
+    type: string
+    default: springhelloworld
+  - name: tag
+    displayName: Image tag
+    type: string
+    default: 0.0.1-SNAPSHOT
+  - name: username
+    displayName: AWS user
+    type: string
+  - name: region
+    displayName: AWS region
+    type: string
+  - name: id
+    displayName: AWS account ID
+    type: string
+  - name: profile
+    displayName: ECR Signing Profile
+    type: string
+  - name: sha
+    displayName: SHA digest
+    type: string
+  - name: environment
+    displayName: Environment to deploy
+    type: string
+    values:
+    - dev
+    - staging
+    - prod
+  - name: cluster_name_dev
+    displayName: DEV cluster name
+    type: string
+  - name: cluster_name_staging
+    displayName: STAGING cluster name
+    type: string
+  - name: cluster_name_prod
+    displayName: PROD cluster name
+    type: string        
+
+  stages:
+  - stage: Deploy_java_container
+    jobs:
+    - job: build_java_container
+      steps:
+      - task: CmdLine@2
+        displayName: "Prepare agent"
+        inputs:
+          script: |
+            echo "Install java 17"
+            sudo apt install openjdk-17-jdk openjdk-17-jre
+
+            echo "Install maven"
+            sudo apt install maven
+
+            echo "Install docker"
+            sudo apt-get update
+            sudo apt-get install ca-certificates curl
+            sudo install -m 0755 -d /etc/apt/keyrings
+            sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+            sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+              $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+              sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update
+
+            sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+            sudo groupadd docker
+            sudo usermod -aG docker spring
+
+            echo "Install AWS CLI"
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+
+            echo "Install Cosign"
+            wget https://github.com/sigstore/cosign/releases/download/v2.5.0/cosign_2.5.0_arm64.deb
+            sudo dpkg -i ~/Downloads/cosign_2.5.0_amd64.deb
+
+      - checkout: spring-docker-demo
+
+      - task: Bash@3
+        displayName: "Build java container"
+        inputs:
+          inlineScript: |
+            #!/bin/bash
+            cd spring-docker-demo
+            ./mvnw package
+            java -jar target/spring-boot-docker-0.0.1-SNAPSHOT.jar
+            docker build -t ${{ parameters.id }}.dkr.ecr.${{ parameters.region }}.amazonaws.com/${{ parameters.image }}:${{ parameters.tag }} .
+
+
+      - task: Bash@3
+        displayName: "Push generated image to registry"
+        inputs:
+          inlineScript: |
+            aws ecr get-login-password --region ${{ parameters.region }} | docker login --username ${{ parameters.username }} --password-stdin ${{ parameters.id }}.ecr.${{ parameters.region }}.amazonaws.com
+            docker push ${{ parameters.id }}.dkr.ecr.${{ parameters.region }}.amazonaws.com/${{ parameters.image }}:${{ parameters.tag }}
+
+      - task: Bash@3
+        displayName: "Sign pushed image to registry"
+        inputs:
+          inlineScript: |
+            cosign generate-key-pair --kms awskms:///${{ parameters.image }}-verification
+            aws ecr get-login-password --region ${{ parameters.region }} | docker login --username ${{ parameters.username }} --password-stdin ${{ parameters.id }}.dkr.ecr.${{ parameters.region }}.amazonaws.com
+            cosign sign --key awskms:///alias/${{ parameters.image }}-verification --upload=true ${{ parameters.id }}.dkr.ecr.${{ parameters.region }}.amazonaws.com/${{ parameters.image }}:${{ parameters.tag }}
+
+    - job: deploy_container_on_dev
+      condition: In( '${{parameters.environment}}', 'dev')
+      steps:
+      - task: CmdLine@2
+        displayName: "Prepare agent"
+        inputs:
+          script: |
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            chmod 700 get_helm.sh
+            /get_helm.sh           
+    
+      - checkout: spring-docker-demo            
+
+      - task: Bash@3
+        displayName: "Deploy the helmfile in DEV"
+        inputs:
+          inlineScript: |         
+            export AWS_ACCESS_KEY_ID=$(access_key)
+            export AWS_SECRET_ACCESS_KEY=$(secret_access_key)
+            export AWS_DEFAULT_REGION=${{ parameters.region }} 
+
+            aws eks --region ${{ parameters.region }} update-kubeconfig --name $(parameters.cluster_name_dev)
+
+            helm install webapp ./webapp-chart
+
+    - job: deploy_container_on_staging
+      condition: In( '${{parameters.environment}}', 'staging')
+      steps:
+      - task: CmdLine@2
+        displayName: "Prepare agent"
+        inputs:
+          script: |
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            chmod 700 get_helm.sh
+            /get_helm.sh           
+    
+      - checkout: spring-docker-demo    
+
+      - task: Bash@3
+        displayName: "Deploy the helmfile in STAGING"
+        inputs:
+          inlineScript: |    
+            export AWS_ACCESS_KEY_ID=$(access_key)
+            export AWS_SECRET_ACCESS_KEY=$(secret_access_key)
+            export AWS_DEFAULT_REGION=${{ parameters.region }} 
+
+            aws eks --region ${{ parameters.region }} update-kubeconfig --name $(parameters.cluster_name_staging)
+
+            helm install webapp ./webapp-chart
+
+    - job: deploy_container_on_prod
+      condition: In( '${{parameters.environment}}', 'prod')
+      steps:
+      - task: CmdLine@2
+        displayName: "Prepare agent"
+        inputs:
+          script: |
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            chmod 700 get_helm.sh
+            /get_helm.sh           
+    
+      - checkout: spring-docker-demo    
+
+      - task: Bash@3
+        displayName: "Deploy the helmfile in PROD"
+        inputs:
+          inlineScript: |         
+            export AWS_ACCESS_KEY_ID=$(access_key)
+            export AWS_SECRET_ACCESS_KEY=$(secret_access_key)
+            export AWS_DEFAULT_REGION=${{ parameters.region }} 
+
+            aws eks --region ${{ parameters.region }} update-kubeconfig --name $(parameters.cluster_name_prod)
+               
+            helm install webapp ./webapp-chart                        
